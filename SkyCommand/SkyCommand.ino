@@ -1,117 +1,198 @@
 //#define __DEBUG__
 //#define __WARN__
-//#define USE_TIMER_1 true
 
 #include <limits.h>
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
 
-// Pin Definitions
+// Pin Definitions (Verified: White TX = Pin 4, Green RX = Pin 2)
 const int txPin = 4;
 const int rxPin = 2;
 
-// Timing Constants
-const int preamble = 7000; //microseconds
-const int one_length = 1200; // Threshold for interpreting a bit as '1', in microseconds.
-const int TIMEOUT_PREAMBLE_SEARCH = 180; // Timeout for preamble search, in milliseconds. Based on 151ms: 7.5ms preamble + 133.5ms (56 bits as '1') + 10ms between messages. Searhing for preamble for the time of two messages (151ms*2) with margin.
-const int TIMEOUT_PREAMBLE_PULSEIN = 18000; //Timeout (microseconds), for preample detection. Based on: 10ms (time between messages) + 7.5ms (preamble) + 4ms (time to first bit after preamble) = 20.5ms = 20500 µs
-const int TIMEOUT_LOGIC_PULSEIN = 3000; // Timeout (microseconds) for every pulseIn call. Based on: 4ms (to first bit) + 1,5ms (logic 1) + 0,75ms (time between pulse)= =6.250ms = 6250 µs 
+// Timing Constants (Verified Skywalker V1 Protocol)
+const int one_length = 1100;              // Threshold for interpreting a bit as '1' (us)
+const unsigned long FRAME_GAP_US = 10000; // 10 ms clean HIGH idle gap between TX frames
+
+// Default Startup / Safe-Idle Actuator Values (0 - 100%)
+const uint8_t DEFAULT_VENT   = 0;   // OT2: Exhaust Fan off
+const uint8_t DEFAULT_FILTER = 0;   // Filter Fan off
+const uint8_t DEFAULT_COOL   = 0;   // Cooling Tray Fan off
+const uint8_t DEFAULT_DRUM   = 0;   // Drum Motor off
+const uint8_t DEFAULT_HEAT   = 0;   // OT1: FIR Heater off
+const char    DEFAULT_UNITS  = 'F'; // Default temperature unit ('F' or 'C')
 
 // Buffer Sizes
-const int roasterLength = 7; //Bytes
-const int controllerLength = 6; //Bytes
+const int roasterLength = 7;    // Bytes
+const int controllerLength = 6; // Bytes
 
 // Buffer Definitions
-uint8_t receiveBuffer[roasterLength];
-uint8_t sendBuffer[controllerLength];
+uint8_t receiveBuffer[roasterLength] = {0};
+uint8_t sendBuffer[controllerLength] = {0};
 
-//Variables
-int ventByte = 0;
-int drumByte = 3;
-int coolByte = 2;
-int filterByte = 1;
-int heatByte = 4;
-int checkByte = 5;
+// Interrupt RX Capture Buffers (Pin 2 / INT1)
+volatile uint8_t isrBuffer[roasterLength] = {0};
+volatile uint8_t isrBitIndex = 0;
+volatile bool isrSync = false;
+volatile bool rxFrameReady = false;
+volatile unsigned long rxFallMicros = 0;
+
+// Byte Indices
+const int ventByte   = 0;
+const int filterByte = 1;
+const int coolByte   = 2;
+const int drumByte   = 3;
+const int heatByte   = 4;
+const int checkByte  = 5;
 
 double temp = 0.0;
 double tempC = 0.0;
-char CorF = 'F';
+char CorF = DEFAULT_UNITS;
 
-//Failsafe variables
-const int maxTemp = 300; //in Celcius
+// Link & Failsafe State
+const int maxTemp = 300; // in Celsius
 unsigned long lastEventTime = 0;
-unsigned long lastEventTimeout = 10000000;
-bool failedToReadRoaster = false;
-int roasterReadAttempts = 0;
-unsigned long lastRoasterSendTime = 0;
-const unsigned long ROASTER_SEND_INTERVAL = 150; // steady stream of cmds is requires
+const unsigned long lastEventTimeout = 10000000UL; // 10 seconds in microseconds
+unsigned long lastFrameEndMicros = 0;
+unsigned long offLockoutUntil = 0;
+bool roasterLinkActive = false;
+
+// Non-blocking Hardware Interrupt (INT1 on Digital Pin 2)
+void rxPinISR() {
+  unsigned long now = micros();
+  if (digitalRead(rxPin) == LOW) {
+    rxFallMicros = now;
+    return;
+  }
+
+  // Do not overwrite an unread completed frame while main loop copies it
+  if (rxFrameReady) return;
+
+  unsigned long lowWidth = now - rxFallMicros;
+
+  // 1. ~7.5 ms LOW preamble marks the start of a 7-byte (56-bit) telemetry frame
+  if (lowWidth > 5000 && lowWidth < 10000) {
+    isrBitIndex = 0;
+    isrSync = true;
+    for (uint8_t i = 0; i < roasterLength; i++) {
+      isrBuffer[i] = 0;
+    }
+  }
+  // 2. Decode 56 data bits (LSB-first: ~1.5 ms LOW = 1, ~600 us LOW = 0)
+  else if (isrSync && isrBitIndex < (roasterLength * 8) && lowWidth >= 300 && lowWidth <= 2500) {
+    if (lowWidth > one_length) {
+      isrBuffer[isrBitIndex / 8] |= (1 << (isrBitIndex % 8));
+    }
+    isrBitIndex++;
+
+    if (isrBitIndex == (roasterLength * 8)) {
+      isrSync = false;
+      rxFrameReady = true;
+    }
+  }
+}
 
 void setControlChecksum() {
   uint8_t sum = 0;
-  for (int i = 0; i < (controllerLength - 1); i++) {
+  for (int i = 0; i < checkByte; i++) {
     sum += sendBuffer[i];
   }
-  sendBuffer[controllerLength - 1] = sum;
+  sendBuffer[checkByte] = sum;
 }
 
 void setValue(uint8_t* bytePtr, uint8_t v) {
   *bytePtr = v;
-  setControlChecksum();  // Always keep the checksum updated.
-}
-
-void shutdown() {  //Turn everything off!
-  for (int i = 0; i < controllerLength; i++) {
-    sendBuffer[i] = 0;
-  }
   setControlChecksum();
 }
 
-void eStop() {  //Emergency stop, heat to 0 and vent to 100
+void applyDefaults() {
+  sendBuffer[ventByte]   = DEFAULT_VENT;
+  sendBuffer[filterByte] = DEFAULT_FILTER;
+  sendBuffer[coolByte]   = DEFAULT_COOL;
+  sendBuffer[drumByte]   = DEFAULT_DRUM;
+  sendBuffer[heatByte]   = DEFAULT_HEAT;
+  setControlChecksum();
+}
+
+void pulsePin(int pin, int duration) {
+  digitalWrite(pin, LOW);
+  delayMicroseconds(duration);
+  digitalWrite(pin, HIGH);
+}
+
+void sendRoasterMessage() {
+  // Send Preamble (~7.5 ms LOW)
+  pulsePin(txPin, 7500);
+  delayMicroseconds(3800);
+
+  // Send 6-byte Message (LSB-first: 1500 us = 1, 600 us = 0, 750 us HIGH gap)
+  for (int i = 0; i < controllerLength; i++) {
+    for (int j = 0; j < 8; j++) {
+      if (bitRead(sendBuffer[i], j) == 1) {
+        pulsePin(txPin, 1500); // logic 1
+      } else {
+        pulsePin(txPin, 600);  // logic 0
+      }
+      delayMicroseconds(750);  // inter-bit gap
+    }
+  }
+
+  lastFrameEndMicros = micros();
+}
+
+void enableRoasterLink() {
+  if (!roasterLinkActive) {
+    noInterrupts();
+    isrBitIndex = 0;
+    isrSync = false;
+    rxFrameReady = false;
+    interrupts();
+
+    pinMode(txPin, OUTPUT);
+    digitalWrite(txPin, HIGH);
+    delay(25); // Clean 25 ms HIGH idle level before first preamble
+
+    pinMode(rxPin, INPUT);
+    attachInterrupt(digitalPinToInterrupt(rxPin), rxPinISR, CHANGE);
+
+    lastEventTime = micros();
+    lastFrameEndMicros = micros() - FRAME_GAP_US; // Transmit immediately on current loop
+    roasterLinkActive = true;
+  }
+}
+
+void disableRoasterLink() {
+  if (roasterLinkActive) {
+    // Flush 3 zeroed frames spaced 10 ms apart so actuators halt cleanly before sleep
+    applyDefaults();
+    for (uint8_t k = 0; k < 3; k++) {
+      sendRoasterMessage();
+      delay(10);
+    }
+
+    detachInterrupt(digitalPinToInterrupt(rxPin));
+
+    // Park TX actively HIGH (idle mark state) so noise cannot trigger false start pulses
+    pinMode(txPin, OUTPUT);
+    digitalWrite(txPin, HIGH);
+    pinMode(rxPin, INPUT);
+
+    roasterLinkActive = false;
+  }
+}
+
+void shutdown() {
+  applyDefaults();
+}
+
+void eStop() {
   setValue(&sendBuffer[heatByte], 0);
   setValue(&sendBuffer[ventByte], 100);
 }
 
-void pulsePin(int pin, int duration) {
-  //Assuming pin is HIGH when we get it
-  digitalWrite(pin, LOW);
-  delayMicroseconds(duration);
-  digitalWrite(pin, HIGH);
-  //we leave it high
-}
-
-void sendRoasterMessage() {
-  //send Preamble
-  pulsePin(txPin, 7500);
-  delayMicroseconds(3800);
-
-  //send Message
-  for (int i = 0; i < controllerLength; i++) {
-    for (int j = 0; j < 8; j++) {
-      if (bitRead(sendBuffer[i], j) == 1) {
-        pulsePin(txPin, 1500);  //delay for a 1
-      } else {
-        pulsePin(txPin, 650);  //delay for a 0
-      }
-      delayMicroseconds(750);  //delay between bits
-    }
-  }
-
-  lastRoasterSendTime = millis();
-}
-
 double calculateTemp() {
-  /* 
-    I really hate this. 
-    It seems to work.. but I feel like there must be a better way than 
-    using a 4th degree polynomial to model this but I sure can't seem to figure it out. 
-  */
-
-  double x = ((receiveBuffer[0] << 8) + receiveBuffer[1]) / 1000.0;
-  double y = ((receiveBuffer[2] << 8) + receiveBuffer[3]) / 1000.0;
-
-#ifdef __DEBUG__
-  Serial.print(x);
-  Serial.print(',');
-  Serial.println(y);
-#endif
+  double x = (((uint16_t)receiveBuffer[0] << 8) | receiveBuffer[1]) / 1000.0;
+  double y = (((uint16_t)receiveBuffer[2] << 8) | receiveBuffer[3]) / 1000.0;
 
   double v = 583.1509258523457 + -714.0345395202813 * x + -196.071718077524 * y
              + 413.37964344228334 * x * x + 2238.149675349052 * x * y
@@ -120,42 +201,14 @@ double calculateTemp() {
              + 247.6124684730026 * y * y * y + -555.8643213534281 * x * x * x * x
              + 3879.431274654493 * x * x * x * y + -6885.682277959339 * x * x * y * y
              + 2868.4191998911865 * x * y * y * y + -1349.1588373011923 * y * y * y * y;
-  tempC = (v - 32) * 5 / 9;
-  if (CorF == 'C') v = (v - 32) * 5 / 9;
 
-  return v;
-}
-
-void receiveSerialBitsFromRoaster(int bytes, int pin) {  //Receives serial bits from the roaster and stores them in the receive buffer.
-  unsigned long timeIntervals[bytes * 8];                //which would in this case be the same as roasterLength
-  int bits = bytes * 8;
-
-  // Single-shot, fast preamble check: if the roaster is responding, preamble begins now
-  unsigned long pulseDuration = pulseIn(pin, LOW, TIMEOUT_PREAMBLE_PULSEIN);
-  if (pulseDuration < 6000 || pulseDuration > 6000) {
-    // No preamble detected
-    failedToReadRoaster = true;
-    return;  //ends the function early
+  double c = (v - 32.0) * 5.0 / 9.0;
+  if (isnan(c) || c < -20.0 || c > 400.0) {
+    return temp; // Reject out-of-bounds polynomial artifact
   }
 
-  for (int i = 0; i < bits; i++) {  //Read the proper number of bits..
-    unsigned long duration = pulseIn(pin, LOW, TIMEOUT_LOGIC_PULSEIN);
-    if (duration == 0) {
-      failedToReadRoaster = true;
-      return;
-    }
-    timeIntervals[i] = duration;
-  }
-
-  memset(receiveBuffer, 0, bytes);  //zero that buffer
-
-  for (int i = 0; i < bits; i++) {  //Convert timings to bits
-    //Bits are received in LSB order..
-    if (timeIntervals[i] > one_length) {  // we received a 1
-      receiveBuffer[i / 8] |= (1 << (i % 8));
-    }
-  }
-  failedToReadRoaster = false;
+  tempC = c;
+  return (CorF == 'C') ? tempC : v;
 }
 
 bool calculateRoasterChecksum() {
@@ -163,110 +216,59 @@ bool calculateRoasterChecksum() {
   for (int i = 0; i < (roasterLength - 1); i++) {
     sum += receiveBuffer[i];
   }
-
-#ifdef __DEBUG__
-  Serial.print("sum: ");
-  Serial.print(sum, HEX);
-  Serial.print(" Checksum Byte: ");
-  Serial.println(receiveBuffer[roasterLength - 1], HEX);
-#endif
   return sum == receiveBuffer[roasterLength - 1];
 }
 
-void printBuffer(int bytes) {
-  for (int i = 0; i < bytes; i++) {
-    Serial.print(sendBuffer[i], HEX);
-    Serial.print(',');
+void processRoasterFrame() {
+  if (!rxFrameReady) return;
+
+  noInterrupts();
+  for (uint8_t i = 0; i < roasterLength; i++) {
+    receiveBuffer[i] = isrBuffer[i];
   }
-  Serial.print("\n");
+  rxFrameReady = false;
+  interrupts();
+
+  if (calculateRoasterChecksum()) {
+    temp = calculateTemp();
+  }
 }
 
-void getRoasterMessage() {
-#ifdef __DEBUG__
-  Serial.print("Debug: Receiving data:");
-#endif
-
-  bool passedChecksum = false;
-  failedToReadRoaster = false;
-
-  roasterReadAttempts += 1;  //Counting number of read attempt
-  if (roasterReadAttempts > 10) {
-    roasterReadAttempts = 10;
-  }
-
-  receiveSerialBitsFromRoaster(roasterLength, rxPin);
-  passedChecksum = calculateRoasterChecksum();
-
-
-  if (passedChecksum == false || failedToReadRoaster == true) {
-#ifdef __WARN__
-    Serial.println(" Failed to read roaster.");
-#endif
-    return;
-  } else {
-  }
-
-#ifdef __DEBUG__
-  printBuffer(roasterLength);
-#endif
-
-#ifdef __WARN__
-  if (roasterReadAttempts > 1) {
-    Serial.print("[!] WARNING: Took ");
-    Serial.print(roasterReadAttempts);
-    Serial.println(" tries to read roaster.");
-  }
-#endif
-  roasterReadAttempts = 0; //reset counter
-  temp = calculateTemp();
+uint8_t clampPercent(uint8_t value) {
+  return (value > 100) ? 100 : value;
 }
+
 void handleHEAT(uint8_t value) {
-  if (value <= 100) {
-    setValue(&sendBuffer[heatByte], value);
-  }
+  setValue(&sendBuffer[heatByte], clampPercent(value));
   lastEventTime = micros();
 }
 
 void handleVENT(uint8_t value) {
-  if (value <= 100) {
-    setValue(&sendBuffer[ventByte], value);
-  }
+  setValue(&sendBuffer[ventByte], clampPercent(value));
   lastEventTime = micros();
 }
 
 void handleCOOL(uint8_t value) {
-  if (value <= 100) {
-    setValue(&sendBuffer[coolByte], value);
-  }
+  setValue(&sendBuffer[coolByte], clampPercent(value));
   lastEventTime = micros();
 }
 
 void handleFILTER(uint8_t value) {
-  if (value <= 100) {
-    setValue(&sendBuffer[filterByte], value);
-  }
+  setValue(&sendBuffer[filterByte], clampPercent(value));
   lastEventTime = micros();
 }
 
 void handleDRUM(uint8_t value) {
-  if (value != 0) {
-    setValue(&sendBuffer[drumByte], 100);
-  } else {
-    setValue(&sendBuffer[drumByte], 0);
-  }
+  setValue(&sendBuffer[drumByte], (value != 0) ? 100 : 0);
   lastEventTime = micros();
 }
 
 void handleCHAN() {
   Serial.println("# Active channels set to 0200");
+  lastEventTime = micros();
 }
 
 void handleREAD() {
-  // Immediately refresh the roaster before listening to keep watchdog alive
-  sendRoasterMessage();
-  getRoasterMessage();
-  sendRoasterMessage();
-
   Serial.print(0.0);
   Serial.print(',');
   Serial.print(temp);
@@ -283,116 +285,119 @@ void handleREAD() {
 }
 
 void getArtisanMessage() {
-  if (Serial.available() > 0) {
-    String input = Serial.readString();
+  if (Serial.available() <= 0) return;
 
-    uint8_t value = 0;
-    input.trim();
-    int split = input.indexOf(';');
-    String command = "";
+  char cmdBuf[32];
+  size_t len = Serial.readBytesUntil('\n', cmdBuf, sizeof(cmdBuf) - 1);
+  cmdBuf[len] = '\0';
 
-    if (split >= 0) {
-      command = input.substring(0, split);
-      value = input.substring(split + 1).toInt();
-    } else {
-      command = input;
+  // Trim trailing \r, spaces, or tabs
+  while (len > 0 && (cmdBuf[len - 1] == '\r' || cmdBuf[len - 1] == ' ' || cmdBuf[len - 1] == '\t')) {
+    cmdBuf[--len] = '\0';
+  }
+  if (len == 0) return;
+
+  uint8_t value = 0;
+  char* paramStr = NULL;
+  char* split = strchr(cmdBuf, ';');
+  if (split != NULL) {
+    *split = '\0';
+    paramStr = split + 1;
+    long parsed = strtol(paramStr, NULL, 10);
+    if (parsed < 0) parsed = 0;
+    if (parsed > 255) parsed = 255;
+    value = (uint8_t)parsed;
+  }
+
+  if (strcmp(cmdBuf, "OFF") == 0) {
+    offLockoutUntil = micros() + 1500000UL; // Ignore stray trailing READ for 1.5 s
+    shutdown();
+    disableRoasterLink();
+    return;
+  }
+
+  bool wakeLink = true;
+
+  if (strcmp(cmdBuf, "READ") == 0) {
+    handleREAD();
+    // Prevent a trailing READ right after OFF from re-enabling the roaster link
+    if ((long)(micros() - offLockoutUntil) < 0) {
+      wakeLink = false;
     }
-
-    if (command == "READ") {
-      handleREAD();
-    } else if (command == "OT1") {  //Set Heater Duty
-      handleHEAT(value);
-    } else if (command == "OT2") {  //Set Fan Duty
-      handleVENT(value);
-    } else if (command == "OFF") {  //Shut it down
-      shutdown();
-    } else if (command == "ESTOP") {  //Emergency stop heat to 0 and vent to 100
-      eStop();
-    } else if (command == "DRUM") {  //Start the drum
-      handleDRUM(value);
-    } else if (command == "FILTER") {  //Turn on the filter fan
-      handleFILTER(value);
-    } else if (command == "COOL") {  //Cool the beans
-      handleCOOL(value);
-    } else if (command == "CHAN") {  //Hanlde the TC4 init message
-      handleCHAN();
-    } else if (command == "UNITS") {
-      if (split >= 0) CorF = input.charAt(split + 1);
+  } else if (strcmp(cmdBuf, "OT1") == 0) {
+    handleHEAT(value);
+  } else if (strcmp(cmdBuf, "OT2") == 0) {
+    handleVENT(value);
+  } else if (strcmp(cmdBuf, "ESTOP") == 0) {
+    eStop();
+    wakeLink = false;
+  } else if (strcmp(cmdBuf, "DRUM") == 0) {
+    handleDRUM(value);
+  } else if (strcmp(cmdBuf, "FILTER") == 0) {
+    handleFILTER(value);
+  } else if (strcmp(cmdBuf, "COOL") == 0) {
+    handleCOOL(value);
+  } else if (strcmp(cmdBuf, "CHAN") == 0) {
+    handleCHAN();
+  } else if (strcmp(cmdBuf, "UNITS") == 0) {
+    if (paramStr != NULL && (paramStr[0] == 'C' || paramStr[0] == 'F')) {
+      CorF = paramStr[0];
     }
+    lastEventTime = micros();
+  } else {
+    wakeLink = false;
+  }
+
+  if (wakeLink) {
+    enableRoasterLink();
   }
 }
 
-//Failsafe functions
-//Don't want the roaster be uncontrolled.. By itself, if you don't send a command in 1sec it will shutdown
-//But I also want to ensure the arduino is getting commands from something.
-//I think a safeguard for this might be to ensure we're regularly receiving control messages.
-//If Artisan is on, it should be polling for temps every few seconds. This requires we get a VALID control command.
-//I also want to add some sort of over temp protection. Butthis is the wild west. Don't burn your roaster and/or house down.
-
-bool itsbeentoolong() {  //Checks if too much time has passed since the last control message
-  unsigned long now = micros();
-  unsigned long duration = now - lastEventTime;
-  //if (duration < 0) {       // Commented out because compiler states comparison of unsigned expression < 0 is always false
-  //  duration = (ULONG_MAX - lastEventTime) + now;  //I think this is right.. right?
-  //}
-  if (duration > lastEventTimeout) {
-    return true;
-  }
-  return false;
+bool itsbeentoolong() {
+  return ((micros() - lastEventTime) > lastEventTimeout);
 }
 
-bool isTemperatureOverLimit() {  //Checks if the current temperature exceeds the maximum allowed temperature in celcius
-  if (tempC > maxTemp) {
-    return true;
-  }
-  return false;
+bool isTemperatureOverLimit() {
+  return (!isnan(tempC) && tempC > maxTemp);
 }
 
 void failSafeChecks() {
-
-  if (itsbeentoolong()) {
-    //TODO: Maybe consider moving this logic to the interrupt handler
-    //That way if the arduino is having issues, the interrupt handler
-    //Will stop sending messages to the roaster and it'll shut down.
-    shutdown();  //Turn everything off if the last control message is too old
+  if (roasterLinkActive && itsbeentoolong()) {
+    shutdown();
+    disableRoasterLink();
   }
-
   if (isTemperatureOverLimit()) {
-    eStop();  //Possible temperature runaway? Emergency stop
+    eStop();
   }
 }
 
-
 void setup() {
-  //ok.. Talking to myself here.. but lets do a sanity check.
-  //The idea is that the loop will handle any requests from serial.
-  //While the timer which runs every 10ms will send the control message to the roaster.
   Serial.begin(115200);
-  Serial.setTimeout(100);
+  Serial.setTimeout(15);
+
+  applyDefaults();
+
+  // Park TX actively HIGH (idle mark state) at boot so roaster stays cleanly asleep until Artisan ON
   pinMode(txPin, OUTPUT);
   digitalWrite(txPin, HIGH);
   pinMode(rxPin, INPUT);
-  shutdown();
 
   lastEventTime = micros();
-
 }
 
 void loop() {
-  //Don't want the roaster be uncontrolled.. By itself, if you don't send a command in 1sec it will shutdown
-  //But I also want to ensure the arduino is getting commands from something.
-  //I think a safeguard for this might be to ensure we're regularly receiving control messages.
-  //If Artisan is on, it should be polling for temps every few seconds. This requires we get a VALID control command.
-  //I also want to add some sort of over temp protection. Butthis is the wild west. Don't burn your roaster and/or house down.
-
   failSafeChecks();
 
-  // Send control message to roaster at a steady heartbeat (every 300ms)
-  // This keeps the roaster watchdog happy without flooding the bus on every loop iteration
-  sendRoasterMessage();
-  //delay(10);
+  // Transmit continuously at 10 ms inter-frame spacing while Artisan is ON
+  if (roasterLinkActive && (micros() - lastFrameEndMicros >= FRAME_GAP_US)) {
+    sendRoasterMessage();
+  }
 
-  //getRoasterMessage();
+  // Decode 56-bit telemetry frames captured via INT1
+  processRoasterFrame();
 
-  getArtisanMessage();
+  // Handle Artisan serial commands
+  if (Serial.available() > 0) {
+    getArtisanMessage();
+  }
 }
