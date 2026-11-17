@@ -13,8 +13,8 @@ const int rxPin = 2;
 const int thermistorPin = A0;
 
 // TC4 Output Channel Assignment (Valid values: 1 to 4; must be distinct and match Artisan Config -> Device -> ET/BT)
-const uint8_t ROASTER_TEMP_CHANNEL = 2; // Channel for the stock roaster probe (ET)
-const uint8_t SECOND_PROBE_CHANNEL = 1; // Channel for the secondary NTC150K probe (A0 / BT)
+const uint8_t ROASTER_TEMP_CHANNEL = 2; // Channel for the stock roaster probe (BT)
+const uint8_t SECOND_PROBE_CHANNEL = 1; // Channel for the secondary NTC150K probe (A0 / ET)
 
 static_assert(ROASTER_TEMP_CHANNEL >= 1 && ROASTER_TEMP_CHANNEL <= 4, "ROASTER_TEMP_CHANNEL must be 1..4");
 static_assert(SECOND_PROBE_CHANNEL >= 1 && SECOND_PROBE_CHANNEL <= 4, "SECOND_PROBE_CHANNEL must be 1..4");
