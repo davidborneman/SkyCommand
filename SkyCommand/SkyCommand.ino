@@ -329,7 +329,14 @@ void processRoasterFrame() {
 }
 
 uint8_t clampPercent(uint8_t value) {
-  return (value > 100) ? 100 : value;
+  if (value > 100) {
+    value = 100;
+  } else if (value < 5) {
+    value = 0;
+  } else  {
+    ((value + 2) / 5) * 5;
+  }
+  return value;
 }
 
 void handleHEAT(uint8_t value) {
@@ -356,7 +363,7 @@ void handleCOOL(uint8_t value) {
 }
 
 void handleFILTER(uint8_t value) {
-  setValue(&sendBuffer[filterByte], clampPercent(value));
+  setValue(&sendBuffer[filterByte], (value != 0) ? 1 : 0);
   lastEventTime = micros();
 }
 
